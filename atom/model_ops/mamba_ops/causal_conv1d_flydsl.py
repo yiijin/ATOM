@@ -1332,9 +1332,905 @@ def build_causal_conv1d_flydsl_v2_module(
     return launch
 
 
+def build_causal_conv1d_flydsl_v3_module(
+    width: int,
+    has_bias: bool,
+    silu: bool,
+    tm: int = 64,
+    tn: int = 64,
+    block_threads: int = 256,
+    dtype_str: str = "bf16",
+):
+    """flydslv3: route-A (low-level idiomatic) rewrite of flydslv2.
+
+    Identical compute/semantics to v2 -- verified **bit-exact** -- so the only
+    change is the FlyDSL API surface, made idiomatic for the installed toolchain
+    (cf. ``kernels/pa_decode_fp8.py``):
+
+      * **Inputs are ``fx.Tensor``** (was raw ``fx.Tensor``); the buffer
+        resources are still built with ``buffer_ops.create_buffer_resource`` and
+        addressed with explicit element strides, exactly like ``pa_decode``.
+      * **Runtime control flow uses plain Python ``if``/``else``** which the
+        FlyDSL AST rewriter lowers to ``scf.if``, replacing the explicit
+        ``scf.IfOp`` + ``with ir.InsertionPoint(...)`` + ``scf.YieldOp([])``
+        boilerplate (value-less branches, so no results are yielded).
+      * **Hot LDS staging keeps ``SmemAllocator``/``SmemPtr``** (standard
+        ``memref`` dialect over a ``memref.global_``). An earlier revision used
+        the ``rmsnorm``-style ``fx.SharedAllocator`` + ``fx.struct`` + ``.view``
+        + ``fx.memref_load``/``fx.memref_store`` path, but that ``fly``-dialect
+        LDS access carries int_tuple/layout coordinate arithmetic that does not
+        fully fold for this staging pattern and cost ~4% on long sequences.
+        ``SmemPtr`` lowers straight to ds_read/ds_write and matches v2 at parity.
+
+    Requires the local FlyDSL (>= 0.2.0, ``/workspace/FlyDSL``): the ``if`` ->
+    ``scf.if`` AST rewrite is a 0.2.0 feature. Original v2 compute notes:
+
+      * LDS stages ``x`` as **bf16** (half the LDS of the fp32 ``_lds`` kernel);
+        the bf16->f32 conversion is deferred to the conv inner loop.
+      * Explicit **fast/slow load split**: a fully-interior tile takes a
+        bounds-free coalesced path; boundary tiles take a sequence-relative
+        path that blends conv_state at the halo.
+      * The store re-stages results through LDS (**transpose**) so the
+        compute thread-map (feat_local=tid>>2, tok_group=tid&3) still yields a
+        feature-coalesced global store.
+      * conv_state writeback (chunk 0) reads the sequence tail from x; the load
+        barrier already orders the halo conv_state reads before this write.
+    """
+    assert _FLYDSL_AVAILABLE, "flydsl is not installed"
+    assert width in (2, 3, 4)
+    assert tm == 64 and tn == 64 and block_threads == 256, \
+        "flydslv2 mirrors v11's fixed TM=TN=64, 256-thread tile"
+
+    W = width
+    KW = W
+    SL = W - 1
+    TM, TN, BT = tm, tn, block_threads
+    LDS_PAD = TM + KW          # halo(KW-1) + body(TM) + pad(1)
+    EPT = TM // 4              # outputs per thread (4 token groups)
+    FG = BT // TM              # feat-base groups in cooperative load (=4)
+    ELEMS = TN * TM // BT      # body features loaded per thread (=16)
+    LOG2_TM = TM.bit_length() - 1   # =6
+    NLDS = TN * LDS_PAD
+    STORE_PAD = TN + 1
+    LDS_BYTES = NLDS * 2       # bf16 staging
+    HAS_BIAS = bool(has_bias)
+    SILU = bool(silu)
+
+    # Hot LDS staging uses ``SmemAllocator``/``SmemPtr`` (standard ``memref``
+    # dialect over a ``memref.global_``) rather than ``fx.SharedAllocator`` +
+    # ``fly.make_view`` + ``fly.memref_load/store``. The ``fly`` LDS path carries
+    # int_tuple/layout coordinate arithmetic that does not fully fold for this
+    # access pattern (~4% slower); ``SmemPtr`` lowers straight to ds_read/ds_write
+    # and matches the v2 hand-tuned kernel bit-for-bit at parity speed.
+    arch = get_rocm_arch()
+    allocator = SmemAllocator(
+        None, arch=arch,
+        global_sym_name=f"causal_conv1d_v3_w{W}_tm{TM}_{dtype_str}",
+    )
+    lds_off = allocator._align(allocator.ptr, 16)
+    allocator.ptr = lds_off + LDS_BYTES
+
+    @flyc.kernel
+    def conv1d_v3_kernel(
+        x_ptr: fx.Tensor,
+        w_ptr: fx.Tensor,
+        bias_ptr: fx.Tensor,
+        cs_ptr: fx.Tensor,
+        cache_idx_ptr: fx.Tensor,
+        has_init_ptr: fx.Tensor,
+        qsl_ptr: fx.Tensor,
+        batch_ptr: fx.Tensor,
+        chunk_off_ptr: fx.Tensor,
+        q_ptr: fx.Tensor,
+        k_ptr: fx.Tensor,
+        v_ptr: fx.Tensor,
+        dim: Int32,
+        kd: Int32,
+        vd: Int32,
+        sx0: Int32,
+        sx1: Int32,
+        sw0: Int32,
+        sw1: Int32,
+        scs0: Int32,
+        scs1: Int32,
+        scs2: Int32,
+        sci: Int32,
+        qs0: Int32,
+        qs1: Int32,
+        ks0: Int32,
+        ks1: Int32,
+        vs0: Int32,
+        vs1: Int32,
+    ):
+        i32 = T.i32
+        elem_dtype = T.bf16 if dtype_str == "bf16" else T.f16
+
+        def _v(x):
+            return x.ir_value() if hasattr(x, "ir_value") else x
+
+        dim = _v(dim); kd = _v(kd); vd = _v(vd)
+        sx0 = _v(sx0); sx1 = _v(sx1); sw0 = _v(sw0); sw1 = _v(sw1)
+        scs0 = _v(scs0); scs1 = _v(scs1); scs2 = _v(scs2); sci = _v(sci)
+        qs0 = _v(qs0); qs1 = _v(qs1); ks0 = _v(ks0); ks1 = _v(ks1)
+        vs0 = _v(vs0); vs1 = _v(vs1)
+
+        def c32(v):
+            return arith.constant(int(v), type=i32)
+
+        def cf(v):
+            return arith.constant(float(v), type=T.f32)
+
+        def to_i32(v):
+            return arith.index_cast(i32, v)
+
+        def mul(a, b):
+            return arith.muli(a, b)
+
+        def add(a, b):
+            return arith.addi(a, b)
+
+        def sub(a, b):
+            return arith.subi(a, b)
+
+        def f32(bf):
+            return arith.extf(T.f32, bf)
+
+        def _rsrc(ptr):
+            return buffer_ops.create_buffer_resource(ptr, max_size=True)
+
+        x_r = _rsrc(x_ptr); w_r = _rsrc(w_ptr); b_r = _rsrc(bias_ptr)
+        cs_r = _rsrc(cs_ptr); ci_r = _rsrc(cache_idx_ptr); hi_r = _rsrc(has_init_ptr)
+        qsl_r = _rsrc(qsl_ptr); batch_r = _rsrc(batch_ptr); choff_r = _rsrc(chunk_off_ptr)
+        q_r = _rsrc(q_ptr); k_r = _rsrc(k_ptr); v_r = _rsrc(v_ptr)
+
+        lds = SmemPtr(allocator.get_base(), lds_off, elem_dtype, shape=(NLDS,))
+        lds.get()
+
+        def lds_st(val, idx):
+            lds.store(val, [idx])
+
+        def lds_ld(idx):
+            return lds.load([idx])
+
+        tid = to_i32(fx.thread_idx.x)
+        pid_x = to_i32(fx.block_idx.x)
+        pid_y = to_i32(fx.block_idx.y)
+
+        seq_idx = buffer_ops.buffer_load(batch_r, pid_x, vec_width=1, dtype=i32)
+        chunk_idx = buffer_ops.buffer_load(choff_r, pid_x, vec_width=1, dtype=i32)
+        seq_start = buffer_ops.buffer_load(qsl_r, seq_idx, vec_width=1, dtype=i32)
+        seq_end = buffer_ops.buffer_load(qsl_r, add(seq_idx, c32(1)), vec_width=1, dtype=i32)
+        seqlen = sub(seq_end, seq_start)
+
+        feat_start = mul(pid_y, c32(TN))
+        tok_start = mul(chunk_idx, c32(TM))
+        is_chunk0 = arith.cmpi(CmpIPredicate.eq, chunk_idx, c32(0))
+
+        feat_local = arith.shrui(tid, c32(2))
+        tok_group = arith.andi(tid, c32(3))
+        tok_base = mul(tok_group, c32(EPT))
+        gfeat = add(feat_start, feat_local)
+        feat_valid = arith.cmpi(CmpIPredicate.slt, gfeat, dim)
+
+        # ── weights + bias (fp32) issued early ──
+        w_base = mul(gfeat, sw0)
+        w_taps = []
+        for j in fx.range_constexpr(W):
+            w_taps.append(f32(buffer_ops.buffer_load(
+                w_r, add(w_base, mul(c32(j), sw1)), vec_width=1, dtype=elem_dtype)))
+        if fx.const_expr(HAS_BIAS):
+            bias_f = f32(buffer_ops.buffer_load(b_r, gfeat, vec_width=1, dtype=elem_dtype))
+        else:
+            bias_f = cf(0.0)
+
+        # ── cooperative load into bf16 LDS ──
+        t_const = arith.andi(tid, c32(TM - 1))
+        f_base = arith.shrui(tid, c32(LOG2_TM))
+        hc = arith.shrui(tid, c32(6))
+        hf = arith.andi(tid, c32(63))
+        tok_gbase = add(sub(add(seq_start, tok_start), c32(KW - 1)), c32(0))  # seq_start+tok_start-(KW-1)
+        gt1 = add(tok_gbase, add(t_const, c32(KW - 1)))                      # seq_start+tok_start+t_const
+
+        all_feat = arith.cmpi(CmpIPredicate.sle, add(feat_start, c32(TN)), dim)
+        all_tok1 = arith.cmpi(CmpIPredicate.slt, add(tok_start, c32(TM - 1)), seqlen)
+        all_tok2 = arith.cmpi(CmpIPredicate.sge, tok_start, c32(KW - 1))
+        fast = arith.andi(arith.andi(all_feat, all_tok1), all_tok2)
+
+        if fast:
+            # fast path: fully interior, coalesced, no bounds/state
+            cur = add(mul(add(feat_start, f_base), sx0), gt1)
+            fstep = mul(c32(FG), sx0)
+            raws = []
+            for j in fx.range_constexpr(ELEMS):
+                raws.append(buffer_ops.buffer_load(x_r, cur, vec_width=1, dtype=elem_dtype))
+                if fx.const_expr(j + 1 < ELEMS):
+                    cur = add(cur, fstep)
+            # issue halo load early (before LDS body stores) to overlap latency
+            do_halo = arith.cmpi(CmpIPredicate.slt, hc, c32(KW - 1))
+            prefix_off = arith.select(
+                do_halo, add(mul(add(feat_start, hf), sx0), add(tok_gbase, hc)), c32(0))
+            prefix_v = buffer_ops.buffer_load(x_r, prefix_off, vec_width=1, dtype=elem_dtype)
+            lds_idx = add(mul(f_base, c32(LDS_PAD)), add(t_const, c32(KW - 1)))
+            for j in fx.range_constexpr(ELEMS):
+                cur_idx = lds_idx if j == 0 else add(lds_idx, c32(j * FG * LDS_PAD))
+                lds_st(raws[j], cur_idx)
+            if do_halo:
+                lds_st(prefix_v, add(mul(hf, c32(LDS_PAD)), hc))
+        else:
+            # slow path: sequence-relative bounds (still coalesced)
+            zero_e = arith.constant(0.0, type=elem_dtype)
+            body_wp = add(tok_start, t_const)
+            body_ok = arith.cmpi(CmpIPredicate.slt, body_wp, seqlen)
+            sl_m1 = arith.select(
+                arith.cmpi(CmpIPredicate.sgt, seqlen, c32(0)), sub(seqlen, c32(1)), c32(0))
+            body_gt = add(seq_start, arith.select(body_ok, body_wp, sl_m1))
+            for j in fx.range_constexpr(ELEMS):
+                gf = add(add(feat_start, f_base), c32(j * FG))
+                gf_ok = arith.cmpi(CmpIPredicate.slt, gf, dim)
+                safe_gf = arith.select(gf_ok, gf, c32(0))
+                raw = buffer_ops.buffer_load(
+                    x_r, add(mul(safe_gf, sx0), body_gt), vec_width=1, dtype=elem_dtype)
+                val = arith.select(arith.andi(body_ok, gf_ok), raw, zero_e)
+                lds_st(val, add(mul(add(f_base, c32(j * FG)), c32(LDS_PAD)),
+                                add(t_const, c32(KW - 1))))
+            # halo column with conv_state blend at chunk0
+            do_halo = arith.cmpi(CmpIPredicate.slt, hc, c32(KW - 1))
+            if do_halo:
+                gf = add(feat_start, hf)
+                gf_ok = arith.cmpi(CmpIPredicate.slt, gf, dim)
+                wp = sub(add(tok_start, hc), c32(KW - 1))
+                wp_in = arith.andi(
+                    arith.cmpi(CmpIPredicate.sge, wp, c32(0)),
+                    arith.cmpi(CmpIPredicate.slt, wp, seqlen))
+                # in-seq source from x
+                safe_xoff = arith.select(
+                    arith.andi(wp_in, gf_ok), add(mul(gf, sx0), add(seq_start, wp)), c32(0))
+                xv = arith.select(
+                    arith.andi(wp_in, gf_ok),
+                    buffer_ops.buffer_load(x_r, safe_xoff, vec_width=1, dtype=elem_dtype),
+                    zero_e)
+                # pre-seq source from conv_state (chunk0 + has_init)
+                hi8 = buffer_ops.buffer_load(hi_r, seq_idx, vec_width=1, dtype=T.i8)
+                hi_nz = arith.cmpi(CmpIPredicate.ne, hi8, arith.constant(0, type=T.i8))
+                need_cs = arith.andi(
+                    arith.andi(arith.cmpi(CmpIPredicate.slt, wp, c32(0)), is_chunk0),
+                    arith.andi(hi_nz, gf_ok))
+                in_coord = buffer_ops.buffer_load(ci_r, mul(seq_idx, sci), vec_width=1, dtype=i32)
+                slot = add(c32(KW - 1), wp)
+                cs_off = arith.select(
+                    need_cs,
+                    add(add(mul(in_coord, scs0), mul(gf, scs1)), mul(slot, scs2)), c32(0))
+                csv = buffer_ops.buffer_load(cs_r, cs_off, vec_width=1, dtype=elem_dtype)
+                hv = arith.select(need_cs, csv, xv)
+                lds_st(hv, add(mul(hf, c32(LDS_PAD)), hc))
+
+        fx.gpu.barrier()
+
+        # ── compute: acc[e] = bias + sum_k w[k] * x[tok_base+e .. +KW-1] ──
+        # The EPT outputs of a thread share their conv window: across e=0..EPT-1
+        # and k=0..W-1 only the contiguous LDS span [row_base .. row_base+EPT+W-2]
+        # is touched. Load that span ONCE into registers (running offset, so the
+        # constant column delta is hoisted out of the address math) and MAC from
+        # registers — this avoids the EPT*W scalar memref.loads whose per-tap
+        # address recomputation is what inflated flydslv2's VALU count vs v11.
+        row_base = add(mul(feat_local, c32(LDS_PAD)), tok_base)
+        NSPAN = EPT + W - 1
+        xw = []
+        for i in fx.range_constexpr(NSPAN):
+            idx = row_base if i == 0 else add(row_base, c32(i))
+            xw.append(f32(lds_ld(idx)))
+        acc = []
+        for e in fx.range_constexpr(EPT):
+            a = bias_f
+            for kk in fx.range_constexpr(W):
+                a = arith.addf(a, arith.mulf(w_taps[kk], xw[e + kk]))
+            if fx.const_expr(SILU):
+                ex = rocdl.exp2(T.f32, arith.mulf(a, cf(-_LOG2E)))
+                a = arith.mulf(a, rocdl.rcp(T.f32, arith.addf(cf(1.0), ex)))
+            acc.append(a)
+
+        # ── store: transpose through LDS (fast) or direct (slow) ──
+        store_fast = arith.andi(
+            arith.cmpi(CmpIPredicate.sle, add(feat_start, c32(TN)), dim),
+            arith.cmpi(CmpIPredicate.slt, add(tok_start, c32(TM - 1)), seqlen))
+        vstart = mul(kd, c32(2))
+        blk_q = arith.cmpi(CmpIPredicate.sle, add(feat_start, c32(TN)), kd)
+        blk_k = arith.andi(
+            arith.cmpi(CmpIPredicate.sge, feat_start, kd),
+            arith.cmpi(CmpIPredicate.sle, add(feat_start, c32(TN)), vstart))
+        blk_v = arith.cmpi(CmpIPredicate.sge, feat_start, vstart)
+
+        if store_fast:
+            fx.gpu.barrier()
+            for e in fx.range_constexpr(EPT):
+                lds_st(arith.truncf(elem_dtype, acc[e]),
+                       add(mul(add(tok_base, c32(e)), c32(STORE_PAD)), feat_local))
+            fx.gpu.barrier()
+            sf = arith.andi(tid, c32(TN - 1))
+            tg = arith.shrui(tid, c32(6))
+            tg_ept = mul(tg, c32(EPT))
+            tok0 = add(add(seq_start, tok_start), tg_ept)
+
+            def emit_fast(cond, res, ts, ds, fo):
+                if cond:
+                    of = sub(add(feat_start, sf), fo)
+                    base_off = add(mul(tok0, ts), mul(of, ds))
+                    cur = base_off
+                    for e in fx.range_constexpr(EPT):
+                        val = lds_ld(add(mul(add(tg_ept, c32(e)), c32(STORE_PAD)), sf))
+                        buffer_ops.buffer_store(val, res, cur)
+                        if fx.const_expr(e + 1 < EPT):
+                            cur = add(cur, ts)
+
+            emit_fast(blk_q, q_r, qs0, qs1, c32(0))
+            emit_fast(blk_k, k_r, ks0, ks1, kd)
+            emit_fast(blk_v, v_r, vs0, vs1, vstart)
+        else:
+            def emit_slow(cond, res, ts, ds, fo):
+                if arith.andi(cond, feat_valid):
+                    of = sub(gfeat, fo)
+                    base_off = add(mul(add(add(seq_start, tok_start), tok_base), ts),
+                                   mul(of, ds))
+                    cur = base_off
+                    for e in fx.range_constexpr(EPT):
+                        tok_ok = arith.cmpi(
+                            CmpIPredicate.slt,
+                            add(add(tok_start, tok_base), c32(e)), seqlen)
+                        if tok_ok:
+                            buffer_ops.buffer_store(
+                                arith.truncf(elem_dtype, acc[e]), res, cur)
+                        if fx.const_expr(e + 1 < EPT):
+                            cur = add(cur, ts)
+
+            emit_slow(blk_q, q_r, qs0, qs1, c32(0))
+            emit_slow(blk_k, k_r, ks0, ks1, kd)
+            emit_slow(blk_v, v_r, vs0, vs1, vstart)
+
+        # ── conv_state writeback (chunk 0) ──
+        if fx.const_expr(SL > 0):
+            if is_chunk0:
+                zero_e = arith.constant(0.0, type=elem_dtype)
+                slot = tok_group
+                should = arith.andi(
+                    arith.cmpi(CmpIPredicate.slt, slot, c32(KW - 1)),
+                    arith.cmpi(CmpIPredicate.slt, gfeat, dim))
+                if should:
+                    in_coord = buffer_ops.buffer_load(
+                        ci_r, mul(seq_idx, sci), vec_width=1, dtype=i32)
+                    pos_x = add(sub(seqlen, c32(KW - 1)), slot)
+                    x_in = arith.cmpi(CmpIPredicate.sge, pos_x, c32(0))
+                    safe_x = arith.select(
+                        x_in, add(mul(gfeat, sx0), add(seq_start, pos_x)), c32(0))
+                    val_x = buffer_ops.buffer_load(x_r, safe_x, vec_width=1, dtype=elem_dtype)
+                    hi8 = buffer_ops.buffer_load(hi_r, seq_idx, vec_width=1, dtype=T.i8)
+                    hi_nz = arith.cmpi(CmpIPredicate.ne, hi8, arith.constant(0, type=T.i8))
+                    need_pr = arith.andi(
+                        arith.cmpi(CmpIPredicate.slt, pos_x, c32(0)), hi_nz)
+                    src = add(slot, seqlen)
+                    safe_pr = arith.select(
+                        need_pr,
+                        add(add(mul(in_coord, scs0), mul(gfeat, scs1)), mul(src, scs2)),
+                        c32(0))
+                    val_pr = buffer_ops.buffer_load(cs_r, safe_pr, vec_width=1, dtype=elem_dtype)
+                    wb_val = arith.select(x_in, val_x, arith.select(need_pr, val_pr, zero_e))
+                    cs_wr = add(add(mul(in_coord, scs0), mul(gfeat, scs1)), mul(slot, scs2))
+                    buffer_ops.buffer_store(wb_val, cs_r, cs_wr)
+
+    @flyc.jit
+    def launch(
+        x_ptr: fx.Tensor,
+        w_ptr: fx.Tensor,
+        bias_ptr: fx.Tensor,
+        cs_ptr: fx.Tensor,
+        cache_idx_ptr: fx.Tensor,
+        has_init_ptr: fx.Tensor,
+        qsl_ptr: fx.Tensor,
+        batch_ptr: fx.Tensor,
+        chunk_off_ptr: fx.Tensor,
+        q_ptr: fx.Tensor,
+        k_ptr: fx.Tensor,
+        v_ptr: fx.Tensor,
+        dim: Int32,
+        kd: Int32,
+        vd: Int32,
+        sx0: Int32,
+        sx1: Int32,
+        sw0: Int32,
+        sw1: Int32,
+        scs0: Int32,
+        scs1: Int32,
+        scs2: Int32,
+        sci: Int32,
+        qs0: Int32,
+        qs1: Int32,
+        ks0: Int32,
+        ks1: Int32,
+        vs0: Int32,
+        vs1: Int32,
+        num_programs: Int32,
+        grid_y_dim: Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        allocator.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            allocator.finalize()
+        gx = arith.index_cast(T.index, num_programs)
+        gy = arith.index_cast(T.index, grid_y_dim)
+        conv1d_v3_kernel(
+            x_ptr, w_ptr, bias_ptr, cs_ptr, cache_idx_ptr, has_init_ptr,
+            qsl_ptr, batch_ptr, chunk_off_ptr, q_ptr, k_ptr, v_ptr,
+            dim, kd, vd, sx0, sx1, sw0, sw1, scs0, scs1, scs2, sci,
+            qs0, qs1, ks0, ks1, vs0, vs1,
+        ).launch(grid=(gx, gy, 1), block=(BT, 1, 1), stream=stream)
+
+    launch._tn = TN
+    launch._tm = TM
+    return launch
+
+
+def build_causal_conv1d_flydsl_v4_module(
+    width: int,
+    has_bias: bool,
+    silu: bool,
+    tm: int = 64,
+    tn: int = 64,
+    block_threads: int = 256,
+    dtype_str: str = "bf16",
+):
+    """flydslv4: route-B (high-level abstraction) variant of flydslv3.
+
+    Same algorithm/control flow as v3 (so still **bit-exact** to v2), but the
+    regular global memory dataflow is expressed with FlyDSL's high-level
+    CuTe-style buffer-tensor API instead of the low-level
+    ``buffer_ops.create_buffer_resource`` + ``buffer_load/store`` with manual
+    linear offsets:
+
+      * **``fx.rocdl.make_buffer_tensor(x/q/k/v/w/bias)``** wraps each global
+        tensor; loads/stores become **layout-indexed** ``x_bt[feat, tok]`` /
+        ``q_bt[tok, feat] = val`` (the tensor layout does the stride math, and
+        AMD buffer addressing still gives OOB->0).
+      * Converted: interior body load, weights, bias, and the q/k/v output
+        store -- i.e. the regular, tile-aligned traffic.
+      * **Not converted (stays low-level):** the slow/boundary path masking,
+        the halo column with conv_state blend, conv_state writeback, and the
+        metadata (qsl/batch/chunk_off/cache_idx/has_init) gathers. These are
+        data-dependent, predicated, non-tile-aligned accesses that do **not**
+        map onto the regular partition/tiled-copy abstractions.
+      * Hot LDS staging keeps ``SmemPtr`` (same as v3).
+
+    PERF (measured, MI350, seq=32768): ~1.6% slower than v2/v3. Cause is **not**
+    the LDS path (SQ_INSTS_LDS and LDS stalls are identical to v3) but **+3%
+    VALU / +2.5% SALU**: ``x_bt[feat, tok]`` recomputes ``feat*sx0 + tok*sx1``
+    (mul+add) per access via the layout, whereas the low-level path strength-
+    reduces the per-iteration address to a single running ``add``. So the
+    high-level abstraction trades a small amount of address-arithmetic ILP for
+    much more readable code.
+
+    Requires the local FlyDSL (>= 0.2.0, ``/workspace/FlyDSL``): the ``if`` ->
+    ``scf.if`` AST rewrite is a 0.2.0 feature. Original v2 compute notes:
+
+      * LDS stages ``x`` as **bf16** (half the LDS of the fp32 ``_lds`` kernel);
+        the bf16->f32 conversion is deferred to the conv inner loop.
+      * Explicit **fast/slow load split**: a fully-interior tile takes a
+        bounds-free coalesced path; boundary tiles take a sequence-relative
+        path that blends conv_state at the halo.
+      * The store re-stages results through LDS (**transpose**) so the
+        compute thread-map (feat_local=tid>>2, tok_group=tid&3) still yields a
+        feature-coalesced global store.
+      * conv_state writeback (chunk 0) reads the sequence tail from x; the load
+        barrier already orders the halo conv_state reads before this write.
+    """
+    assert _FLYDSL_AVAILABLE, "flydsl is not installed"
+    assert width in (2, 3, 4)
+    assert tm == 64 and tn == 64 and block_threads == 256, \
+        "flydslv2 mirrors v11's fixed TM=TN=64, 256-thread tile"
+
+    W = width
+    KW = W
+    SL = W - 1
+    TM, TN, BT = tm, tn, block_threads
+    LDS_PAD = TM + KW          # halo(KW-1) + body(TM) + pad(1)
+    EPT = TM // 4              # outputs per thread (4 token groups)
+    FG = BT // TM              # feat-base groups in cooperative load (=4)
+    ELEMS = TN * TM // BT      # body features loaded per thread (=16)
+    LOG2_TM = TM.bit_length() - 1   # =6
+    NLDS = TN * LDS_PAD
+    STORE_PAD = TN + 1
+    LDS_BYTES = NLDS * 2       # bf16 staging
+    HAS_BIAS = bool(has_bias)
+    SILU = bool(silu)
+
+    # Hot LDS staging uses ``SmemAllocator``/``SmemPtr`` (standard ``memref``
+    # dialect over a ``memref.global_``) rather than ``fx.SharedAllocator`` +
+    # ``fly.make_view`` + ``fly.memref_load/store``. The ``fly`` LDS path carries
+    # int_tuple/layout coordinate arithmetic that does not fully fold for this
+    # access pattern (~4% slower); ``SmemPtr`` lowers straight to ds_read/ds_write
+    # and matches the v2 hand-tuned kernel bit-for-bit at parity speed.
+    arch = get_rocm_arch()
+    allocator = SmemAllocator(
+        None, arch=arch,
+        global_sym_name=f"causal_conv1d_v4_w{W}_tm{TM}_{dtype_str}",
+    )
+    lds_off = allocator._align(allocator.ptr, 16)
+    allocator.ptr = lds_off + LDS_BYTES
+
+    @flyc.kernel
+    def conv1d_v4_kernel(
+        x_ptr: fx.Tensor,
+        w_ptr: fx.Tensor,
+        bias_ptr: fx.Tensor,
+        cs_ptr: fx.Tensor,
+        cache_idx_ptr: fx.Tensor,
+        has_init_ptr: fx.Tensor,
+        qsl_ptr: fx.Tensor,
+        batch_ptr: fx.Tensor,
+        chunk_off_ptr: fx.Tensor,
+        q_ptr: fx.Tensor,
+        k_ptr: fx.Tensor,
+        v_ptr: fx.Tensor,
+        dim: Int32,
+        kd: Int32,
+        vd: Int32,
+        sx0: Int32,
+        sx1: Int32,
+        sw0: Int32,
+        sw1: Int32,
+        scs0: Int32,
+        scs1: Int32,
+        scs2: Int32,
+        sci: Int32,
+        qs0: Int32,
+        qs1: Int32,
+        ks0: Int32,
+        ks1: Int32,
+        vs0: Int32,
+        vs1: Int32,
+    ):
+        i32 = T.i32
+        elem_dtype = T.bf16 if dtype_str == "bf16" else T.f16
+
+        def _v(x):
+            return x.ir_value() if hasattr(x, "ir_value") else x
+
+        dim = _v(dim); kd = _v(kd); vd = _v(vd)
+        sx0 = _v(sx0); sx1 = _v(sx1); sw0 = _v(sw0); sw1 = _v(sw1)
+        scs0 = _v(scs0); scs1 = _v(scs1); scs2 = _v(scs2); sci = _v(sci)
+        qs0 = _v(qs0); qs1 = _v(qs1); ks0 = _v(ks0); ks1 = _v(ks1)
+        vs0 = _v(vs0); vs1 = _v(vs1)
+
+        def c32(v):
+            return arith.constant(int(v), type=i32)
+
+        def cf(v):
+            return arith.constant(float(v), type=T.f32)
+
+        def to_i32(v):
+            return arith.index_cast(i32, v)
+
+        def mul(a, b):
+            return arith.muli(a, b)
+
+        def add(a, b):
+            return arith.addi(a, b)
+
+        def sub(a, b):
+            return arith.subi(a, b)
+
+        def f32(bf):
+            return arith.extf(T.f32, bf)
+
+        def _rsrc(ptr):
+            return buffer_ops.create_buffer_resource(ptr, max_size=True)
+
+        x_r = _rsrc(x_ptr); w_r = _rsrc(w_ptr); b_r = _rsrc(bias_ptr)
+        cs_r = _rsrc(cs_ptr); ci_r = _rsrc(cache_idx_ptr); hi_r = _rsrc(has_init_ptr)
+        qsl_r = _rsrc(qsl_ptr); batch_r = _rsrc(batch_ptr); choff_r = _rsrc(chunk_off_ptr)
+        q_r = _rsrc(q_ptr); k_r = _rsrc(k_ptr); v_r = _rsrc(v_ptr)
+
+        # v4: high-level buffer tensors. x for the interior body load, q/k/v for
+        # the output store. Indexed by (feature/token, ...) coords; the tensor
+        # layout does the stride math and buffer addressing gives OOB->0.
+        x_bt = fx.rocdl.make_buffer_tensor(x_ptr)
+        q_bt = fx.rocdl.make_buffer_tensor(q_ptr)
+        k_bt = fx.rocdl.make_buffer_tensor(k_ptr)
+        v_bt = fx.rocdl.make_buffer_tensor(v_ptr)
+        w_bt = fx.rocdl.make_buffer_tensor(w_ptr)
+        b_bt = fx.rocdl.make_buffer_tensor(bias_ptr)
+
+        lds = SmemPtr(allocator.get_base(), lds_off, elem_dtype, shape=(NLDS,))
+        lds.get()
+
+        def lds_st(val, idx):
+            lds.store(val, [idx])
+
+        def lds_ld(idx):
+            return lds.load([idx])
+
+        tid = to_i32(fx.thread_idx.x)
+        pid_x = to_i32(fx.block_idx.x)
+        pid_y = to_i32(fx.block_idx.y)
+
+        seq_idx = buffer_ops.buffer_load(batch_r, pid_x, vec_width=1, dtype=i32)
+        chunk_idx = buffer_ops.buffer_load(choff_r, pid_x, vec_width=1, dtype=i32)
+        seq_start = buffer_ops.buffer_load(qsl_r, seq_idx, vec_width=1, dtype=i32)
+        seq_end = buffer_ops.buffer_load(qsl_r, add(seq_idx, c32(1)), vec_width=1, dtype=i32)
+        seqlen = sub(seq_end, seq_start)
+
+        feat_start = mul(pid_y, c32(TN))
+        tok_start = mul(chunk_idx, c32(TM))
+        is_chunk0 = arith.cmpi(CmpIPredicate.eq, chunk_idx, c32(0))
+
+        feat_local = arith.shrui(tid, c32(2))
+        tok_group = arith.andi(tid, c32(3))
+        tok_base = mul(tok_group, c32(EPT))
+        gfeat = add(feat_start, feat_local)
+        feat_valid = arith.cmpi(CmpIPredicate.slt, gfeat, dim)
+
+        # ── weights + bias (fp32) issued early ──
+        w_taps = []
+        for j in fx.range_constexpr(W):
+            w_taps.append(f32(w_bt[gfeat, c32(j)]))
+        if fx.const_expr(HAS_BIAS):
+            bias_f = f32(b_bt[gfeat])
+        else:
+            bias_f = cf(0.0)
+
+        # ── cooperative load into bf16 LDS ──
+        t_const = arith.andi(tid, c32(TM - 1))
+        f_base = arith.shrui(tid, c32(LOG2_TM))
+        hc = arith.shrui(tid, c32(6))
+        hf = arith.andi(tid, c32(63))
+        tok_gbase = add(sub(add(seq_start, tok_start), c32(KW - 1)), c32(0))  # seq_start+tok_start-(KW-1)
+        gt1 = add(tok_gbase, add(t_const, c32(KW - 1)))                      # seq_start+tok_start+t_const
+
+        all_feat = arith.cmpi(CmpIPredicate.sle, add(feat_start, c32(TN)), dim)
+        all_tok1 = arith.cmpi(CmpIPredicate.slt, add(tok_start, c32(TM - 1)), seqlen)
+        all_tok2 = arith.cmpi(CmpIPredicate.sge, tok_start, c32(KW - 1))
+        fast = arith.andi(arith.andi(all_feat, all_tok1), all_tok2)
+
+        if fast:
+            # fast path: fully interior, coalesced, no bounds/state
+            # v4 high-level: index buffer tensor by (feature, token) coords
+            f0 = add(feat_start, f_base)
+            raws = []
+            for j in fx.range_constexpr(ELEMS):
+                fj = f0 if j == 0 else add(f0, c32(j * FG))
+                raws.append(x_bt[fj, gt1])
+            # issue halo load early (before LDS body stores) to overlap latency
+            do_halo = arith.cmpi(CmpIPredicate.slt, hc, c32(KW - 1))
+            prefix_off = arith.select(
+                do_halo, add(mul(add(feat_start, hf), sx0), add(tok_gbase, hc)), c32(0))
+            prefix_v = buffer_ops.buffer_load(x_r, prefix_off, vec_width=1, dtype=elem_dtype)
+            lds_idx = add(mul(f_base, c32(LDS_PAD)), add(t_const, c32(KW - 1)))
+            for j in fx.range_constexpr(ELEMS):
+                cur_idx = lds_idx if j == 0 else add(lds_idx, c32(j * FG * LDS_PAD))
+                lds_st(raws[j], cur_idx)
+            if do_halo:
+                lds_st(prefix_v, add(mul(hf, c32(LDS_PAD)), hc))
+        else:
+            # slow path: sequence-relative bounds (still coalesced)
+            zero_e = arith.constant(0.0, type=elem_dtype)
+            body_wp = add(tok_start, t_const)
+            body_ok = arith.cmpi(CmpIPredicate.slt, body_wp, seqlen)
+            sl_m1 = arith.select(
+                arith.cmpi(CmpIPredicate.sgt, seqlen, c32(0)), sub(seqlen, c32(1)), c32(0))
+            body_gt = add(seq_start, arith.select(body_ok, body_wp, sl_m1))
+            for j in fx.range_constexpr(ELEMS):
+                gf = add(add(feat_start, f_base), c32(j * FG))
+                gf_ok = arith.cmpi(CmpIPredicate.slt, gf, dim)
+                safe_gf = arith.select(gf_ok, gf, c32(0))
+                raw = buffer_ops.buffer_load(
+                    x_r, add(mul(safe_gf, sx0), body_gt), vec_width=1, dtype=elem_dtype)
+                val = arith.select(arith.andi(body_ok, gf_ok), raw, zero_e)
+                lds_st(val, add(mul(add(f_base, c32(j * FG)), c32(LDS_PAD)),
+                                add(t_const, c32(KW - 1))))
+            # halo column with conv_state blend at chunk0
+            do_halo = arith.cmpi(CmpIPredicate.slt, hc, c32(KW - 1))
+            if do_halo:
+                gf = add(feat_start, hf)
+                gf_ok = arith.cmpi(CmpIPredicate.slt, gf, dim)
+                wp = sub(add(tok_start, hc), c32(KW - 1))
+                wp_in = arith.andi(
+                    arith.cmpi(CmpIPredicate.sge, wp, c32(0)),
+                    arith.cmpi(CmpIPredicate.slt, wp, seqlen))
+                # in-seq source from x
+                safe_xoff = arith.select(
+                    arith.andi(wp_in, gf_ok), add(mul(gf, sx0), add(seq_start, wp)), c32(0))
+                xv = arith.select(
+                    arith.andi(wp_in, gf_ok),
+                    buffer_ops.buffer_load(x_r, safe_xoff, vec_width=1, dtype=elem_dtype),
+                    zero_e)
+                # pre-seq source from conv_state (chunk0 + has_init)
+                hi8 = buffer_ops.buffer_load(hi_r, seq_idx, vec_width=1, dtype=T.i8)
+                hi_nz = arith.cmpi(CmpIPredicate.ne, hi8, arith.constant(0, type=T.i8))
+                need_cs = arith.andi(
+                    arith.andi(arith.cmpi(CmpIPredicate.slt, wp, c32(0)), is_chunk0),
+                    arith.andi(hi_nz, gf_ok))
+                in_coord = buffer_ops.buffer_load(ci_r, mul(seq_idx, sci), vec_width=1, dtype=i32)
+                slot = add(c32(KW - 1), wp)
+                cs_off = arith.select(
+                    need_cs,
+                    add(add(mul(in_coord, scs0), mul(gf, scs1)), mul(slot, scs2)), c32(0))
+                csv = buffer_ops.buffer_load(cs_r, cs_off, vec_width=1, dtype=elem_dtype)
+                hv = arith.select(need_cs, csv, xv)
+                lds_st(hv, add(mul(hf, c32(LDS_PAD)), hc))
+
+        fx.gpu.barrier()
+
+        # ── compute: acc[e] = bias + sum_k w[k] * x[tok_base+e .. +KW-1] ──
+        # The EPT outputs of a thread share their conv window: across e=0..EPT-1
+        # and k=0..W-1 only the contiguous LDS span [row_base .. row_base+EPT+W-2]
+        # is touched. Load that span ONCE into registers (running offset, so the
+        # constant column delta is hoisted out of the address math) and MAC from
+        # registers — this avoids the EPT*W scalar memref.loads whose per-tap
+        # address recomputation is what inflated flydslv2's VALU count vs v11.
+        row_base = add(mul(feat_local, c32(LDS_PAD)), tok_base)
+        NSPAN = EPT + W - 1
+        xw = []
+        for i in fx.range_constexpr(NSPAN):
+            idx = row_base if i == 0 else add(row_base, c32(i))
+            xw.append(f32(lds_ld(idx)))
+        acc = []
+        for e in fx.range_constexpr(EPT):
+            a = bias_f
+            for kk in fx.range_constexpr(W):
+                a = arith.addf(a, arith.mulf(w_taps[kk], xw[e + kk]))
+            if fx.const_expr(SILU):
+                ex = rocdl.exp2(T.f32, arith.mulf(a, cf(-_LOG2E)))
+                a = arith.mulf(a, rocdl.rcp(T.f32, arith.addf(cf(1.0), ex)))
+            acc.append(a)
+
+        # ── store: transpose through LDS (fast) or direct (slow) ──
+        store_fast = arith.andi(
+            arith.cmpi(CmpIPredicate.sle, add(feat_start, c32(TN)), dim),
+            arith.cmpi(CmpIPredicate.slt, add(tok_start, c32(TM - 1)), seqlen))
+        vstart = mul(kd, c32(2))
+        blk_q = arith.cmpi(CmpIPredicate.sle, add(feat_start, c32(TN)), kd)
+        blk_k = arith.andi(
+            arith.cmpi(CmpIPredicate.sge, feat_start, kd),
+            arith.cmpi(CmpIPredicate.sle, add(feat_start, c32(TN)), vstart))
+        blk_v = arith.cmpi(CmpIPredicate.sge, feat_start, vstart)
+
+        if store_fast:
+            fx.gpu.barrier()
+            for e in fx.range_constexpr(EPT):
+                lds_st(arith.truncf(elem_dtype, acc[e]),
+                       add(mul(add(tok_base, c32(e)), c32(STORE_PAD)), feat_local))
+            fx.gpu.barrier()
+            sf = arith.andi(tid, c32(TN - 1))
+            tg = arith.shrui(tid, c32(6))
+            tg_ept = mul(tg, c32(EPT))
+            tok0 = add(add(seq_start, tok_start), tg_ept)
+
+            def emit_fast(cond, out_bt, fo):
+                if cond:
+                    of = sub(add(feat_start, sf), fo)
+                    for e in fx.range_constexpr(EPT):
+                        val = lds_ld(add(mul(add(tg_ept, c32(e)), c32(STORE_PAD)), sf))
+                        out_bt[add(tok0, c32(e)), of] = val
+
+            emit_fast(blk_q, q_bt, c32(0))
+            emit_fast(blk_k, k_bt, kd)
+            emit_fast(blk_v, v_bt, vstart)
+        else:
+            def emit_slow(cond, out_bt, fo):
+                if arith.andi(cond, feat_valid):
+                    of = sub(gfeat, fo)
+                    tok0s = add(add(seq_start, tok_start), tok_base)
+                    for e in fx.range_constexpr(EPT):
+                        tok_ok = arith.cmpi(
+                            CmpIPredicate.slt,
+                            add(add(tok_start, tok_base), c32(e)), seqlen)
+                        if tok_ok:
+                            out_bt[add(tok0s, c32(e)), of] = arith.truncf(elem_dtype, acc[e])
+
+            emit_slow(blk_q, q_bt, c32(0))
+            emit_slow(blk_k, k_bt, kd)
+            emit_slow(blk_v, v_bt, vstart)
+
+        # ── conv_state writeback (chunk 0) ──
+        if fx.const_expr(SL > 0):
+            if is_chunk0:
+                zero_e = arith.constant(0.0, type=elem_dtype)
+                slot = tok_group
+                should = arith.andi(
+                    arith.cmpi(CmpIPredicate.slt, slot, c32(KW - 1)),
+                    arith.cmpi(CmpIPredicate.slt, gfeat, dim))
+                if should:
+                    in_coord = buffer_ops.buffer_load(
+                        ci_r, mul(seq_idx, sci), vec_width=1, dtype=i32)
+                    pos_x = add(sub(seqlen, c32(KW - 1)), slot)
+                    x_in = arith.cmpi(CmpIPredicate.sge, pos_x, c32(0))
+                    safe_x = arith.select(
+                        x_in, add(mul(gfeat, sx0), add(seq_start, pos_x)), c32(0))
+                    val_x = buffer_ops.buffer_load(x_r, safe_x, vec_width=1, dtype=elem_dtype)
+                    hi8 = buffer_ops.buffer_load(hi_r, seq_idx, vec_width=1, dtype=T.i8)
+                    hi_nz = arith.cmpi(CmpIPredicate.ne, hi8, arith.constant(0, type=T.i8))
+                    need_pr = arith.andi(
+                        arith.cmpi(CmpIPredicate.slt, pos_x, c32(0)), hi_nz)
+                    src = add(slot, seqlen)
+                    safe_pr = arith.select(
+                        need_pr,
+                        add(add(mul(in_coord, scs0), mul(gfeat, scs1)), mul(src, scs2)),
+                        c32(0))
+                    val_pr = buffer_ops.buffer_load(cs_r, safe_pr, vec_width=1, dtype=elem_dtype)
+                    wb_val = arith.select(x_in, val_x, arith.select(need_pr, val_pr, zero_e))
+                    cs_wr = add(add(mul(in_coord, scs0), mul(gfeat, scs1)), mul(slot, scs2))
+                    buffer_ops.buffer_store(wb_val, cs_r, cs_wr)
+
+    @flyc.jit
+    def launch(
+        x_ptr: fx.Tensor,
+        w_ptr: fx.Tensor,
+        bias_ptr: fx.Tensor,
+        cs_ptr: fx.Tensor,
+        cache_idx_ptr: fx.Tensor,
+        has_init_ptr: fx.Tensor,
+        qsl_ptr: fx.Tensor,
+        batch_ptr: fx.Tensor,
+        chunk_off_ptr: fx.Tensor,
+        q_ptr: fx.Tensor,
+        k_ptr: fx.Tensor,
+        v_ptr: fx.Tensor,
+        dim: Int32,
+        kd: Int32,
+        vd: Int32,
+        sx0: Int32,
+        sx1: Int32,
+        sw0: Int32,
+        sw1: Int32,
+        scs0: Int32,
+        scs1: Int32,
+        scs2: Int32,
+        sci: Int32,
+        qs0: Int32,
+        qs1: Int32,
+        ks0: Int32,
+        ks1: Int32,
+        vs0: Int32,
+        vs1: Int32,
+        num_programs: Int32,
+        grid_y_dim: Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        allocator.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            allocator.finalize()
+        gx = arith.index_cast(T.index, num_programs)
+        gy = arith.index_cast(T.index, grid_y_dim)
+        conv1d_v4_kernel(
+            x_ptr, w_ptr, bias_ptr, cs_ptr, cache_idx_ptr, has_init_ptr,
+            qsl_ptr, batch_ptr, chunk_off_ptr, q_ptr, k_ptr, v_ptr,
+            dim, kd, vd, sx0, sx1, sw0, sw1, scs0, scs1, scs2, sci,
+            qs0, qs1, ks0, ks1, vs0, vs1,
+        ).launch(grid=(gx, gy, 1), block=(BT, 1, 1), stream=stream)
+
+    launch._tn = TN
+    launch._tm = TM
+    return launch
+
+
+
+
 @functools.lru_cache(maxsize=None)
 def _get_compiled_v2(width, has_bias, silu, tm, tn, block_threads, dtype_str):
     return build_causal_conv1d_flydsl_v2_module(
+        width, has_bias, silu, tm, tn, block_threads, dtype_str
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _get_compiled_v3(width, has_bias, silu, tm, tn, block_threads, dtype_str):
+    return build_causal_conv1d_flydsl_v3_module(
+        width, has_bias, silu, tm, tn, block_threads, dtype_str
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _get_compiled_v4(width, has_bias, silu, tm, tn, block_threads, dtype_str):
+    return build_causal_conv1d_flydsl_v4_module(
         width, has_bias, silu, tm, tn, block_threads, dtype_str
     )
 
@@ -1431,7 +2327,19 @@ def causal_conv1d_flydsl_fn(
         return query, key, value
 
     dtype_str = "bf16" if x.dtype == torch.bfloat16 else "fp16"
-    if impl == "v2":
+    if impl == "v4":
+        launcher = _get_compiled_v4(
+            int(width), bias is not None, bool(silu), int(block_m), 64, 256, dtype_str
+        )
+        tn = launcher._tn
+        grid_y_dim = (dim + tn - 1) // tn
+    elif impl == "v3":
+        launcher = _get_compiled_v3(
+            int(width), bias is not None, bool(silu), int(block_m), 64, 256, dtype_str
+        )
+        tn = launcher._tn
+        grid_y_dim = (dim + tn - 1) // tn
+    elif impl == "v2":
         launcher = _get_compiled_v2(
             int(width), bias is not None, bool(silu), int(block_m), 64, 256, dtype_str
         )
